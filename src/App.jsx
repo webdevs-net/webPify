@@ -3,9 +3,21 @@ import Header from "./components/Header";
 import ImageUploader from "./components/ImageUploader";
 import CompressionOptions from "./components/CompressionOptions";
 import ImageList from "./components/ImageList";
-import Counter from "./components/Counter";
-import { convertToWebP, downloadAsZip } from "./utils/imageProcessing";
-import { redisCounter } from "./utils/redisCounter";
+import FeatureFooter from "./components/FeatureFooter";
+import MobileConverter from "./components/MobileConverter";
+import { Images } from "lucide-react";
+import {
+  convertImage,
+  createImagePreview,
+  downloadAsZip,
+  getOutputFilename,
+  getOutputFormat,
+} from "./utils/imageProcessing";
+
+const compactNumberFormatter = new Intl.NumberFormat("en", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
 
 function App() {
   const [images, setImages] = useState([]);
@@ -18,48 +30,32 @@ function App() {
   const [isDownloading, setIsDownloading] = useState(false);
   const [lossless, setLossless] = useState(false);
   const [preserveMetadata, setPreserveMetadata] = useState(false);
-  const [conversionCount, setConversionCount] = useState(0);
-  const [isCounterLoading, setIsCounterLoading] = useState(true);
+  const [outputFormat, setOutputFormat] = useState("webp");
+  const [conversionCount, setConversionCount] = useState(null);
+  const [isCompactViewport, setIsCompactViewport] = useState(
+    () => window.matchMedia("(max-width: 1024px)").matches
+  );
 
-  // Function to increment conversion counter
-  const incrementConversionCounter = async () => {
-    try {
-      const newCount = await redisCounter.incrementCounter();
-      if (newCount !== null) {
-        setConversionCount(newCount);
-      }
-    } catch (error) {
-      console.error('Error incrementing conversion counter:', error);
-    }
-  };
-
-  // Function to refresh counter display
-  const refreshCounter = async () => {
-    try {
-      setIsCounterLoading(true);
-      const currentCount = await redisCounter.getCounter();
-      setConversionCount(currentCount);
-    } catch (error) {
-      console.error('Error refreshing counter:', error);
-    } finally {
-      setIsCounterLoading(false);
-    }
-  };
-
-  // Load initial counter value
   useEffect(() => {
-    const loadInitialCounter = async () => {
+    const loadConversionCount = async () => {
       try {
-        const currentCount = await redisCounter.getCounter();
-        setConversionCount(currentCount);
+        const response = await fetch("/api/conversion-count");
+        if (!response.ok) throw new Error("Unable to load conversion count");
+        const data = await response.json();
+        setConversionCount(data.count);
       } catch (error) {
-        console.error('Error loading initial counter:', error);
-      } finally {
-        setIsCounterLoading(false);
+        console.error("Unable to load conversion count:", error);
       }
     };
 
-    loadInitialCounter();
+    loadConversionCount();
+  }, []);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia("(max-width: 1024px)");
+    const handleViewportChange = (event) => setIsCompactViewport(event.matches);
+    mediaQuery.addEventListener("change", handleViewportChange);
+    return () => mediaQuery.removeEventListener("change", handleViewportChange);
   }, []);
 
   // Track changes to compression options
@@ -67,24 +63,51 @@ function App() {
     if (images.some((img) => img.status === "done")) {
       setOptionsChanged(true);
     }
-  }, [compressionLevel, resolution, lossless, preserveMetadata, images]);
+  }, [compressionLevel, resolution, outputFormat, lossless, preserveMetadata, images]);
 
 
 
-  const handleImageUpload = (newImages) => {
-    const imageObjects = Array.from(newImages).map((file) => ({
-      id: crypto.randomUUID(),
-      file,
-      originalSize: file.size,
-      name: file.name,
-      preview: URL.createObjectURL(file),
-      webpBlob: null,
-      webpSize: null,
-      status: "queued",
-      progress: 0,
-    }));
+  const handleImageUpload = async (newImages) => {
+    const imageObjects = await Promise.all(
+      Array.from(newImages).map(async (file) => {
+        let preview = null;
+
+        try {
+          preview = await createImagePreview(file);
+        } catch (error) {
+          console.error(`Unable to create preview for ${file.name}:`, error);
+        }
+
+        return {
+          id: crypto.randomUUID(),
+          file,
+          originalSize: file.size,
+          name: file.name,
+          preview,
+          webpBlob: null,
+          webpSize: null,
+          status: "queued",
+          progress: 0,
+        };
+      })
+    );
 
     setImages((prev) => [...prev, ...imageObjects]);
+  };
+
+  const recordConversions = async (amount) => {
+    try {
+      const response = await fetch("/api/conversion-count", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ amount }),
+      });
+      if (!response.ok) throw new Error("Unable to update conversion count");
+      const data = await response.json();
+      setConversionCount(data.count);
+    } catch (error) {
+      console.error("Unable to update conversion count:", error);
+    }
   };
 
   const processImages = async (imagesToProcess) => {
@@ -128,11 +151,12 @@ function App() {
           updateProgress(progress);
         }
 
-        const webpBlob = await convertToWebP(
+        const webpBlob = await convertImage(
           currentImage.file,
           compressionLevel,
           resolution.width,
           resolution.height,
+          outputFormat,
           lossless,
           preserveMetadata
         );
@@ -145,15 +169,13 @@ function App() {
                   webpBlob,
                   webpSize: webpBlob.size,
                   webpPreview: URL.createObjectURL(webpBlob),
+                  outputFormat,
                   status: "done",
                   progress: 100,
                 }
               : img
           )
         );
-
-        // Increment conversion counter for successful conversion
-        await incrementConversionCounter();
 
         processedCount++;
         setOverallProgress(Math.round((processedCount / totalImages) * 100));
@@ -172,6 +194,10 @@ function App() {
     setCurrentProcessingIndex(null);
     setIsProcessing(false);
     setOverallProgress(100);
+
+    if (processedCount > 0) {
+      recordConversions(processedCount);
+    }
   };
 
   const handleConvertAll = async () => {
@@ -207,7 +233,10 @@ function App() {
   };
 
   const handleReset = () => {
-    // Clear all images and reset state
+    images.forEach((image) => {
+      if (image.preview) URL.revokeObjectURL(image.preview);
+      if (image.webpPreview) URL.revokeObjectURL(image.webpPreview);
+    });
     setImages([]);
     setOverallProgress(0);
     setCurrentProcessingIndex(null);
@@ -215,6 +244,9 @@ function App() {
   };
 
   const handleRemoveImage = (id) => {
+    const image = images.find((item) => item.id === id);
+    if (image?.preview) URL.revokeObjectURL(image.preview);
+    if (image?.webpPreview) URL.revokeObjectURL(image.webpPreview);
     setImages((prev) => prev.filter((img) => img.id !== id));
   };
 
@@ -223,12 +255,25 @@ function App() {
       if (img.webpBlob && img.status === "done") {
         const link = document.createElement("a");
         link.href = URL.createObjectURL(img.webpBlob);
-        link.download = img.name.replace(/\.[^/.]+$/, "") + ".webp";
+        link.download = getOutputFilename(img.name, img.outputFormat);
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
+        URL.revokeObjectURL(link.href);
       }
     });
+  };
+
+  const handleDownloadImage = (image) => {
+    if (!image.webpBlob || image.status !== "done") return;
+
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(image.webpBlob);
+    link.download = getOutputFilename(image.name, image.outputFormat);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(link.href);
   };
 
   const handleDownloadAsZip = async () => {
@@ -237,7 +282,7 @@ function App() {
 
     setIsDownloading(true);
     try {
-      await downloadAsZip(completedImages);
+      await downloadAsZip(completedImages, "webpify-images.zip");
     } catch (error) {
       console.error("Error creating zip file:", error);
     } finally {
@@ -245,87 +290,133 @@ function App() {
     }
   };
 
+  if (isCompactViewport) {
+    return (
+      <MobileConverter
+        images={images}
+        onUpload={handleImageUpload}
+        onRemove={handleRemoveImage}
+        onReset={handleReset}
+        onConvert={handleConvertAll}
+        onDownloadAll={handleDownloadAll}
+        onDownloadImage={handleDownloadImage}
+        compressionLevel={compressionLevel}
+        setCompressionLevel={setCompressionLevel}
+        resolution={resolution}
+        setResolution={setResolution}
+        outputFormat={outputFormat}
+        setOutputFormat={setOutputFormat}
+        lossless={lossless}
+        setLossless={setLossless}
+        preserveMetadata={preserveMetadata}
+        setPreserveMetadata={setPreserveMetadata}
+        isProcessing={isProcessing}
+        overallProgress={overallProgress}
+        currentProcessingIndex={currentProcessingIndex}
+      />
+    );
+  }
+
   return (
-    <div className="min-h-screen bg-[#f3f3f7] font-sans flex flex-col">
-      <Header />
-      <div className="flex-grow">
-        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-            <div className="lg:col-span-4 space-y-6">
+    <div className="page-stage">
+      <div className="app-shell">
+        <Header />
+
+        <main className="app-content">
+          <section className="hero-section">
+            <div className="hero-copy">
+              <div className="hero-badge">ϟ&nbsp;&nbsp; Faster Images. A Lighter Web.</div>
+              <h1>Convert Images to {getOutputFormat(outputFormat).label}</h1>
+              <p>
+                Reduce file size by up to 80% while keeping outstanding quality. Fast, free and privacy-friendly. No sign up required.
+              </p>
+            </div>
+
+            <aside className="usage-card" aria-label="WebPify usage">
+              <span className="usage-card-icon" aria-hidden="true">
+                <Images size={18} strokeWidth={2} />
+              </span>
+              <span className="usage-card-copy">
+                <strong
+                  aria-live="polite"
+                  title={
+                    conversionCount === null
+                      ? undefined
+                      : `${new Intl.NumberFormat("en").format(conversionCount)} images converted`
+                  }
+                >
+                  {conversionCount === null
+                    ? "Loading usage..."
+                    : `${compactNumberFormatter.format(conversionCount)} images converted`}
+                </strong>
+                <small>by the WebPify community and counting</small>
+              </span>
+            </aside>
+          </section>
+
+          <div className="converter-grid">
+            <div className="converter-controls">
               <CompressionOptions
                 compressionLevel={compressionLevel}
                 setCompressionLevel={setCompressionLevel}
                 resolution={resolution}
                 setResolution={setResolution}
+                outputFormat={outputFormat}
+                setOutputFormat={setOutputFormat}
                 lossless={lossless}
                 setLossless={setLossless}
                 preserveMetadata={preserveMetadata}
                 setPreserveMetadata={setPreserveMetadata}
               />
-              <div className="space-y-4">
-                <div className="flex gap-3">
-                  <button
-                    className="flex-1 py-3 px-4 bg-[#0267ff] hover:bg-[#0255ff] disabled:bg-[#0267ff]/50 text-white font-semibold rounded-lg transition-colors shadow-sm disabled:cursor-not-allowed"
-                    onClick={handleConvertAll}
-                    disabled={isProcessing || images.length === 0}
-                  >
+
+              <div className="flex gap-2">
+                <button
+                  className="convert-button"
+                  onClick={handleConvertAll}
+                  disabled={isProcessing || images.length === 0}
+                >
+                  <span>
                     {isProcessing
                       ? "Converting..."
                       : optionsChanged
                       ? "Apply New Settings"
-                      : "Convert to WebP"}
+                      : `Convert to ${getOutputFormat(outputFormat).label}`}
+                  </span>
+                  <span className="text-lg">→</span>
+                </button>
+                {images.length > 0 && (
+                  <button
+                    className="reset-button"
+                    onClick={handleReset}
+                    disabled={isProcessing}
+                  >
+                    Reset
                   </button>
-
-                  {images.length > 0 && (
-                    <button
-                      className="py-3 px-4 bg-[#f3f3f7] hover:bg-[#e5e5ea] text-[#2c2d2a] font-semibold rounded-lg transition-colors shadow-sm"
-                      onClick={handleReset}
-                      disabled={isProcessing}
-                    >
-                      Reset
-                    </button>
-                  )}
-                </div>
-
-                {isProcessing && (
-                  <div className="bg-white rounded-xl p-4 shadow-sm">
-                    <div className="flex justify-between items-center mb-2">
-                      <span className="text-sm font-medium text-[#2c2d2a]">
-                        Overall Progress
-                      </span>
-                      <span className="text-sm font-medium text-[#0267ff]">
-                        {overallProgress}%
-                      </span>
-                    </div>
-                    <div className="bg-[#f3f3f7] rounded-full h-2 overflow-hidden">
-                      <div
-                        className="bg-[#0267ff] h-full rounded-full transition-all duration-300 ease-in-out"
-                        style={{ width: `${overallProgress}%` }}
-                      ></div>
-                    </div>
-                    <p className="text-xs text-[#6b7280] mt-2">
-                      {currentProcessingIndex !== null
-                        ? `Processing: ${
-                            images[currentProcessingIndex]?.name || ""
-                          }`
-                        : "Preparing files..."}
-                    </p>
-                  </div>
                 )}
-
-                {optionsChanged &&
-                  !isProcessing &&
-                  images.some((img) => img.status === "done") && (
-                    <div className="bg-[#fff8e6] border border-[#ffeeba] rounded-xl p-3 text-[#856404] text-sm">
-                      <p>
-                        Compression settings have changed. Click "Apply New
-                        Settings" to update all images.
-                      </p>
-                    </div>
-                  )}
               </div>
+
+              {isProcessing && (
+                <div className="status-card">
+                  <div className="mb-2 flex justify-between">
+                    <span>Overall Progress</span>
+                    <span className="font-bold text-[#2878f0]">{overallProgress}%</span>
+                  </div>
+                  <div className="h-1.5 overflow-hidden rounded-full bg-[#e9edf4]">
+                    <div
+                      className="h-full rounded-full bg-[#2878f0] transition-all"
+                      style={{ width: `${overallProgress}%` }}
+                    />
+                  </div>
+                  <p className="mt-2 text-[11px] text-[#8a93a3]">
+                    {currentProcessingIndex !== null
+                      ? `Processing: ${images[currentProcessingIndex]?.name || ""}`
+                      : "Preparing files..."}
+                  </p>
+                </div>
+              )}
             </div>
-            <div className="lg:col-span-8">
+
+            <div className="converter-results">
               {images.length === 0 ? (
                 <ImageUploader onImageUpload={handleImageUpload} />
               ) : (
@@ -342,10 +433,8 @@ function App() {
             </div>
           </div>
         </main>
+        <FeatureFooter />
       </div>
-      
-      {/* Conversion Counter */}
-      <Counter count={conversionCount} isLoading={isCounterLoading} />
     </div>
   );
 }
