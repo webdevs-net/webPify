@@ -1,8 +1,27 @@
 {
-  "name": "WebPify",
+  "name": "webpify",
   "private": true,
   "version": "1.0.0",
+  "description": "Browser-based image converter focused on WebP — convert, compress, and resize locally.",
   "type": "module",
+  "license": "MIT",
+  "author": "Rokib <rokib16x@gmail.com> (https://rokib.dev)",
+  "homepage": "https://github.com/webdevs-net/webPify#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/webdevs-net/webPify.git"
+  },
+  "bugs": {
+    "url": "https://github.com/webdevs-net/webPify/issues"
+  },
+  "keywords": [
+    "webp",
+    "image-converter",
+    "image-compression",
+    "react",
+    "vite",
+    "open-source"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -10,6 +29,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.4",
     "heic-convert": "^2.1.0",
     "heic2any": "^0.0.4",
     "jszip": "^3.10.1",
